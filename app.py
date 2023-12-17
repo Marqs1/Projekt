@@ -1,40 +1,46 @@
 from flask import Flask, request, jsonify, render_template
 import os
 from werkzeug.utils import secure_filename
-import base64
 from PIL import Image
-from io import BytesIO
 import smtplib
-from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.image import MIMEImage
+from dotenv import load_dotenv
+
+# Załaduj konfigurację z pliku .env
+load_dotenv()
 
 app = Flask(__name__)
-
-# Folder for storing uploaded images
 UPLOAD_FOLDER = 'uploads'
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 
-def encrypt_and_embed_text(image_path, text):
-    # Encode the text into bytes
-    text_bytes = text.encode('utf-8')
+def embed_text_in_image(image_path, text, output_path):
+    image = Image.open(image_path)
+    image = image.convert("RGBA")
 
-    # Open the image
-    with open(image_path, 'rb') as image_file:
-        # Read the image data
-        image_data = image_file.read()
+    text += "\0"  # Dodanie znaku końca tekstu
+    binary_text = ''.join(format(ord(char), '08b') for char in text)
 
-    # Combine the image data and text bytes
-    combined_data = image_data + text_bytes
+    width, height = image.size
+    pixels = image.load()
 
-    # Create a new image with the combined data
-    encrypted_image = Image.open(BytesIO(combined_data))
+    text_index = 0
+    for y in range(height):
+        for x in range(width):
+            pixel = list(pixels[x, y])
 
-    # Save the new image
-    encrypted_image_path = os.path.join(UPLOAD_FOLDER, 'encrypted_image.png')
-    encrypted_image.save(encrypted_image_path)
+            for n in range(3):  # Przejdź przez R, G, B
+                if text_index < len(binary_text):
+                    pixel[n] = pixel[n] & ~1 | int(binary_text[text_index])
+                    text_index += 1
 
-    return encrypted_image_path
+            pixels[x, y] = tuple(pixel)
+
+            if text_index >= len(binary_text):
+                image.save(output_path, format='PNG')
+                return
+
+    image.save(output_path, format='PNG')
 
 @app.route('/')
 def index():
@@ -42,52 +48,47 @@ def index():
 
 @app.route('/upload', methods=['POST'])
 def upload_image():
-    # Check if the POST request has a file part
-    if 'image' not in request.files or 'text' not in request.form:
-        return jsonify({'error': 'Image or text not provided'})
+    if 'image' not in request.files:
+        return jsonify({'error': 'Image not provided'})
 
     image = request.files['image']
-    text = request.form['text']
+    text = request.form.get('text', '')
 
-    # If the user does not select a file, the browser may submit an empty file without a filename
+    text_file = request.files.get('text_file')
+    if text_file:
+        text = text_file.read().decode('utf-8')
+
     if image.filename == '':
         return jsonify({'error': 'No selected image'})
 
-    # Save the image to the uploads folder using secure_filename
     image_path = os.path.join(app.config['UPLOAD_FOLDER'], secure_filename(image.filename))
     image.save(image_path)
 
-    # Encrypt and embed text in the image
-    encrypted_image_path = encrypt_and_embed_text(image_path, text)
+    output_path = os.path.join(app.config['UPLOAD_FOLDER'], image.filename)
+    embed_text_in_image(image_path, text, output_path)
 
-    # Send the encrypted image via email
-    send_email(encrypted_image_path)
+    send_email(output_path)
 
-    return jsonify({'message': 'Image uploaded, text encrypted, and email sent successfully'})
+    return jsonify({'message': 'Image uploaded, text embedded, and email sent successfully'})
 
 def send_email(image_path):
-    # Email configuration (replace with your SMTP server details)
-    smtp_server = 'your_smtp_server.com'
-    smtp_port = 587
-    smtp_username = 'your_email@example.com'
-    smtp_password = 'your_email_password'
-    sender_email = 'your_email@example.com'
-    receiver_email = 'recipient_email@example.com'
+    smtp_server = os.getenv('SMTP_SERVER')
+    smtp_port = os.getenv('SMTP_PORT', 587)
+    smtp_username = os.getenv('SMTP_USERNAME')
+    smtp_password = os.getenv('SMTP_PASSWORD')
+    sender_email = os.getenv('SENDER_EMAIL')
+    receiver_email = os.getenv('RECEIVER_EMAIL')
 
-    # Create the email message
     message = MIMEMultipart()
     message['From'] = sender_email
     message['To'] = receiver_email
-    message['Subject'] = 'Encrypted Image with Hidden Text'
+    message['Subject'] = 'Image with Embedded Text'
 
-    # Attach the encrypted image to the email
     with open(image_path, 'rb') as image_file:
-        image_data = image_file.read()
-        image_attachment = MIMEImage(image_data)
+        image_attachment = MIMEImage(image_file.read(), _subtype="png")
         message.attach(image_attachment)
 
-    # Connect to the SMTP server and send the email
-    with smtplib.SMTP(smtp_server, smtp_port) as server:
+    with smtplib.SMTP(smtp_server, int(smtp_port)) as server:
         server.starttls()
         server.login(smtp_username, smtp_password)
         server.sendmail(sender_email, receiver_email, message.as_string())
